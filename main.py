@@ -2,6 +2,7 @@
 """
 JDE Connector — Hosted API
 ===========================
+
 This is the server-side counterpart to the thin client that runs on each
 client's machine. Every piece of logic that used to be shipped to the
 client — table allowlists, SQL validation, schema descriptions, department
@@ -22,17 +23,20 @@ Run locally with:
 On Render (or a similar platform-as-a-service), the platform terminates
 HTTPS for you — the start command there is:
     uvicorn main:app --host 0.0.0.0 --port $PORT
+
 No reverse proxy (Caddy/nginx) is needed on Render; that's only for a
 self-managed VPS where nothing else provides TLS for you. Either way, API
 keys must never travel over plain HTTP, so don't skip whichever of the two
 applies to where this ends up running.
 """
+
 import os
 import re
 import sqlite3
 import json
 import datetime
 import secrets
+import threading
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -49,11 +53,11 @@ CLIENTS_PATH = os.environ.get(
 )
 LOG_PATH = os.path.join(os.path.dirname(__file__), "query_log.jsonl")
 MOCK_DB_PATH = os.path.join(os.path.dirname(__file__), "jde_mock.db")
+
 MAX_ROWS = 200
 ORACLE_CALL_TIMEOUT_MS = 15000
 
 app = FastAPI(title="JDE Connector API")
-
 
 # ---------------------------------------------------------------------------
 # Client/deployment registry — one entry per API key you've issued (one
@@ -63,6 +67,8 @@ app = FastAPI(title="JDE Connector API")
 # permissions (chmod 600 clients.json), or move it to a real secrets
 # manager once you have more than a handful of clients.
 # ---------------------------------------------------------------------------
+
+
 def load_clients() -> dict:
     if not os.path.exists(CLIENTS_PATH):
         return {}
@@ -77,6 +83,7 @@ def authenticate(authorization: Optional[str]) -> dict:
     because it never runs on their machine."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or malformed API key.")
+
     api_key = authorization[len("Bearer "):].strip()
 
     deployment = None
@@ -84,6 +91,7 @@ def authenticate(authorization: Optional[str]) -> dict:
         if secrets.compare_digest(key, api_key):
             deployment = entry
             break
+
     if deployment is None:
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
@@ -113,6 +121,8 @@ def authenticate(authorization: Optional[str]) -> dict:
 # useful side effect of this move: one place to see usage across your
 # whole client base, including refused/attempted access.
 # ---------------------------------------------------------------------------
+
+
 def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None) -> None:
     entry = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -130,21 +140,92 @@ def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[i
 
 
 # ---------------------------------------------------------------------------
-# Per-deployment database connection. This is the piece that differs from
-# the old local script: each deployment's Oracle DSN points at wherever
-# THAT client's tunnel makes their database reachable from this server
-# (e.g. "localhost:15211/JDEDB" if you're forwarding their Oracle port to
-# a client-specific local port via an SSH reverse tunnel).
+# Per-deployment database connection pooling.
+#
+# Previously this opened a brand new Oracle connection (a full TCP
+# handshake + auth round-trip to the Oracle listener) on every single
+# query. That's the single most expensive part of handling a request,
+# and it was being paid in full every time.
+#
+# Now: one connection pool per distinct (dsn, user) pair, created lazily
+# on first use and reused for every subsequent request from any
+# deployment that shares those credentials. Acquiring a connection from
+# an existing pool is fast (just handing out an already-open session);
+# only the very first request for a given deployment pays the full
+# connection-setup cost.
+#
+# oracledb's pooled connections behave specially with .close(): calling
+# it on a connection that came from a pool releases it back to the pool
+# instead of actually tearing down the session. That means the rest of
+# this file (conn.cursor(), conn.close(), etc.) needs no changes at all
+# — the speedup is entirely contained in get_connection().
 # ---------------------------------------------------------------------------
+
+_pools: dict = {}
+_pools_lock = threading.Lock()
+
+# Pool sizing — deliberately conservative defaults, since this server may
+# serve several deployments and each pool holds its own real Oracle
+# sessions. Tune via environment variables if a specific deployment needs
+# more concurrency.
+POOL_MIN = int(os.environ.get("ORACLE_POOL_MIN", "1"))
+POOL_MAX = int(os.environ.get("ORACLE_POOL_MAX", "5"))
+POOL_INCREMENT = int(os.environ.get("ORACLE_POOL_INCREMENT", "1"))
+# How long an idle pooled connection is kept open before Oracle-side or
+# pool-side cleanup may reclaim it. Matches ORACLE_CALL_TIMEOUT_MS's spirit
+# — don't hold idle sessions open indefinitely.
+POOL_TIMEOUT_SECONDS = int(os.environ.get("ORACLE_POOL_TIMEOUT_SECONDS", "300"))
+
+
+def _get_or_create_pool(user: str, password: str, dsn: str):
+    """Return the shared pool for this (dsn, user) pair, creating it if
+    this is the first request that's needed it. Thread-safe: FastAPI runs
+    synchronous path operations in a thread pool, so concurrent first
+    requests for the same new deployment are a real possibility."""
+    import oracledb  # imported lazily so mock-only testing never needs it
+
+    pool_key = (dsn, user)
+    pool = _pools.get(pool_key)
+    if pool is not None:
+        return pool
+
+    with _pools_lock:
+        # Re-check inside the lock — another thread may have created it
+        # while this one was waiting.
+        pool = _pools.get(pool_key)
+        if pool is not None:
+            return pool
+
+        try:
+            pool = oracledb.create_pool(
+                user=user,
+                password=password,
+                dsn=dsn,
+                min=POOL_MIN,
+                max=POOL_MAX,
+                increment=POOL_INCREMENT,
+                timeout=POOL_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            # Don't cache a failed pool — the next request should retry
+            # cleanly rather than being stuck with a broken pool forever
+            # (e.g. if this failed because the DB was briefly unreachable).
+            raise RuntimeError(f"Could not create connection pool: {e}") from e
+
+        _pools[pool_key] = pool
+        return pool
+
+
 def get_connection(deployment: dict):
     db = deployment.get("db", {})
     dsn = db.get("dsn", "").strip()
-    if dsn:
-        import oracledb  # imported lazily so mock-only testing never needs it
 
-        conn = oracledb.connect(user=db["user"], password=db["password"], dsn=dsn)
+    if dsn:
+        pool = _get_or_create_pool(db["user"], db["password"], dsn)
+        conn = pool.acquire()
         conn.call_timeout = ORACLE_CALL_TIMEOUT_MS
         return conn, True
+
     # No DSN configured for this deployment yet — fall back to the shared
     # mock DB. Useful for standing up and testing this server before any
     # tunnel is live.
@@ -157,6 +238,7 @@ def get_connection(deployment: dict):
 # SQL guardrails — identical logic to the old local script, just living
 # here now where a client can't read or edit it.
 # ---------------------------------------------------------------------------
+
 WRITE_KEYWORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|MERGE|GRANT|REVOKE)\b",
     re.IGNORECASE,
@@ -207,6 +289,8 @@ def table_ref(table: str, oracle: bool) -> str:
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
+
+
 class QueryRequest(BaseModel):
     sql: str
 
@@ -214,6 +298,8 @@ class QueryRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints — these mirror the tool names the thin client exposes to Claude
 # ---------------------------------------------------------------------------
+
+
 @app.post("/v1/query")
 def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(default=None)):
     deployment = authenticate(authorization)
@@ -242,7 +328,7 @@ def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(
         cur.execute(sql)
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchmany(MAX_ROWS + 1)
-        conn.close()
+        conn.close()  # for pooled connections, this releases back to the pool, not a real close
     except Exception as e:
         log_query(name, sql, "error", error=str(e))
         return {"result": f"DATABASE ERROR: {e}"}
@@ -254,15 +340,18 @@ def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(
     truncated = len(rows) > MAX_ROWS
     rows = rows[:MAX_ROWS]
     log_query(name, sql, "executed", row_count=len(rows))
+
     lines = [" | ".join(cols)]
     for row in rows:
         lines.append(" | ".join(str(v) for v in row))
     result = "\n".join(lines)
+
     if truncated:
         result += (
             f"\n\n[Results truncated at {MAX_ROWS} rows. Narrow your "
             f"question to see a complete answer.]"
         )
+
     return {"result": result}
 
 
@@ -285,8 +374,10 @@ def get_jde_schema(authorization: Optional[str] = Header(default=None)):
         dialect_note = "SQL DIALECT: SQLite (mock data mode). Table names have no schema prefix."
 
     sections = [dialect_note, ""]
+
     if visible_tables is not None and not visible_tables:
         sections.append("NOTE: no tables are configured for this deployment — contact your vendor.")
+
     for table in config.TABLES:
         if visible_tables is not None and table["name"] not in visible_tables:
             continue
@@ -333,8 +424,8 @@ def get_jde_schema(authorization: Optional[str] = Header(default=None)):
 # the folder" — this is what prevents a topic value like "../main.py" (or
 # anything else not on this list) from ever reaching the filesystem.
 # ---------------------------------------------------------------------------
-REFERENCES_DIR = os.path.join(os.path.dirname(__file__), "references")
 
+REFERENCES_DIR = os.path.join(os.path.dirname(__file__), "references")
 REFERENCE_TOPICS = {
     "par-file-structure": "par-file-structure.md",
     "master-reference": "master-reference.md",
@@ -362,11 +453,14 @@ def get_reference(topic: str, authorization: Optional[str] = Header(default=None
             status_code=404,
             detail=f"Unknown reference topic '{topic}'. Valid topics: {', '.join(sorted(REFERENCE_TOPICS))}",
         )
+
     path = os.path.join(REFERENCES_DIR, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Reference file for '{topic}' is missing on the server.")
+
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
+
     return {"content": content}
 
 
