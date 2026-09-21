@@ -39,7 +39,8 @@ import secrets
 import threading
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+import ipaddress
 from pydantic import BaseModel
 
 import config  # your existing table/schema/business-rule definitions — move the real file here unchanged
@@ -51,13 +52,98 @@ import config  # your existing table/schema/business-rule definitions — move t
 CLIENTS_PATH = os.environ.get(
     "CLIENTS_PATH", os.path.join(os.path.dirname(__file__), "clients.json")
 )
-LOG_PATH = os.path.join(os.path.dirname(__file__), "query_log.jsonl")
+
+# Files the app WRITES to at runtime (query log, device bindings) need a
+# genuinely persistent disk, not Render's default ephemeral one — a
+# Secret File (like CLIENTS_PATH above) is read-only at runtime and isn't
+# the right mechanism for this. Set PERSISTENT_DATA_DIR to the mount path
+# of a Render Persistent Disk (e.g. /var/data) to make these survive
+# every redeploy. Left unset, both fall back to a plain local file next
+# to this script — fine for local testing, but will silently reset on
+# every Render redeploy if left this way in production.
+PERSISTENT_DATA_DIR = os.environ.get("PERSISTENT_DATA_DIR", "").strip()
+_data_dir = PERSISTENT_DATA_DIR or os.path.dirname(__file__)
+os.makedirs(_data_dir, exist_ok=True)
+
+LOG_PATH = os.path.join(_data_dir, "query_log.jsonl")
 MOCK_DB_PATH = os.path.join(os.path.dirname(__file__), "jde_mock.db")
+
+# Device binding store — maps API key -> the device ID that first claimed
+# it. Uses the same PERSISTENT_DATA_DIR as LOG_PATH above, for the same
+# reason: this file is written by the app at runtime, so it needs a real
+# persistent disk to survive a redeploy, not Render's default ephemeral one.
+DEVICE_BINDINGS_PATH = os.path.join(_data_dir, "device_bindings.json")
+_bindings_lock = threading.Lock()
+
+# --- Manual export/restore workflow (only needed if NOT using a Render
+# Persistent Disk for PERSISTENT_DATA_DIR above) ---
+#
+# ADMIN_SECRET gates a separate /admin/export-bindings endpoint that dumps
+# the current device_bindings.json content — copy that output BEFORE
+# triggering a redeploy, then paste it into a Secret File at the path
+# below (e.g. upload it as DEVICE_BINDINGS_SEED_PATH=/etc/secrets/device_bindings_seed.json
+# in Render's dashboard) BEFORE the redeploy finishes starting up. On
+# startup, if the live bindings file doesn't exist yet but a seed file
+# does, the seed content becomes the starting bindings.
+#
+# This ONLY helps if you remember to do the export-then-paste dance
+# before every single deploy — miss it once and that deploy's bindings
+# reset anyway. A Persistent Disk needs this zero times, ever.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "").strip()
+DEVICE_BINDINGS_SEED_PATH = os.environ.get("DEVICE_BINDINGS_SEED_PATH", "").strip()
+
+
+def seed_device_bindings_if_needed() -> None:
+    """Called once at startup. If the live bindings file doesn't exist yet
+    (a fresh/ephemeral disk) but a seed file is configured and present,
+    use the seed content as the starting bindings. Never overwrites an
+    already-existing live bindings file."""
+    if os.path.exists(DEVICE_BINDINGS_PATH):
+        return  # already has real data (e.g. a genuine persistent disk) — never clobber it
+    if not DEVICE_BINDINGS_SEED_PATH or not os.path.exists(DEVICE_BINDINGS_SEED_PATH):
+        return  # nothing to seed from
+    try:
+        with open(DEVICE_BINDINGS_SEED_PATH, "r", encoding="utf-8") as f:
+            seed_data = json.load(f)
+        with open(DEVICE_BINDINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(seed_data, f, indent=2)
+    except (json.JSONDecodeError, OSError):
+        pass  # a bad seed file shouldn't crash startup — just start with no bindings
+
+
+def load_device_bindings() -> dict:
+    if not os.path.exists(DEVICE_BINDINGS_PATH):
+        return {}
+    try:
+        with open(DEVICE_BINDINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}  # corrupted/unreadable bindings file — fail open on THIS file only,
+        # since losing device bindings just means re-claiming, not a security bypass
+
+
+def save_device_binding(api_key: str, device_id: str) -> None:
+    with _bindings_lock:
+        bindings = load_device_bindings()
+        bindings[api_key] = device_id
+        serialized = json.dumps(bindings, indent=2)
+        tmp_path = DEVICE_BINDINGS_PATH + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+            os.replace(tmp_path, DEVICE_BINDINGS_PATH)
+        except OSError:
+            pass  # a failed write here shouldn't break the request that triggered it
 
 MAX_ROWS = 200
 ORACLE_CALL_TIMEOUT_MS = 15000
 
 app = FastAPI(title="JDE Connector API")
+
+
+@app.on_event("startup")
+def _on_startup():
+    seed_device_bindings_if_needed()
 
 # ---------------------------------------------------------------------------
 # Client/deployment registry — one entry per API key you've issued (one
@@ -76,11 +162,50 @@ def load_clients() -> dict:
         return json.load(f)
 
 
-def authenticate(authorization: Optional[str]) -> dict:
-    """Validate the Authorization header and return the deployment's
-    config dict, or raise a 401/403 with a clear reason. This check is the
-    real enforcement point now — it can't be edited away by a client,
-    because it never runs on their machine."""
+def get_client_ip(request: Request) -> str:
+    """Get the real originating client IP, not the reverse proxy's own
+    address. Render (like most hosted platforms) sits in front of this
+    app — the raw TCP connection appears to come from Render's internal
+    infrastructure, not the actual client. The real IP is in the
+    X-Forwarded-For header instead, which can be a comma-separated chain
+    if multiple proxies were involved; the FIRST entry is the original
+    client, later ones are intermediate hops. Falls back to the raw
+    connection IP only when there's no such header (e.g. running this
+    locally with no proxy in front of it at all)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _ip_allowed(client_ip: str, allowed: list) -> bool:
+    """Check client_ip against a list that can mix plain IPs and CIDR
+    ranges (e.g. ["203.0.113.5", "198.51.100.0/24"])."""
+    try:
+        ip_obj = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False  # couldn't even parse the client IP — fail closed
+    for entry in allowed:
+        entry = entry.strip()
+        try:
+            if "/" in entry:
+                if ip_obj in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif client_ip == entry:
+                return True
+        except ValueError:
+            continue  # a malformed entry in clients.json shouldn't crash auth — just skip it
+    return False
+
+
+def authenticate(authorization: Optional[str], client_ip: Optional[str] = None, device_id: Optional[str] = None) -> dict:
+    """Validate the Authorization header (and, if configured for this
+    deployment, the source IP and/or device binding) and return the
+    deployment's config dict, or raise a 401/403 with a clear reason.
+    This check is the real enforcement point now — it can't be edited
+    away by a client, because it never runs on their machine."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or malformed API key.")
 
@@ -112,6 +237,72 @@ def authenticate(authorization: Optional[str]) -> dict:
         except ValueError:
             pass  # malformed date in clients.json — don't crash on it, just skip expiry
 
+    # IP allowlisting — optional, per deployment. A deployment with no
+    # "allowed_ips" set has no IP restriction at all (backward compatible
+    # with every existing client). One set explicitly rejects any request
+    # from outside that list, REGARDLESS of whether the API key itself is
+    # valid — this is what actually stops a shared key from working
+    # outside the expected network, not just something that gets noticed
+    # after the fact in the log.
+    allowed_ips = deployment.get("allowed_ips")
+    if allowed_ips:
+        if client_ip is None or not _ip_allowed(client_ip, allowed_ips):
+            log_query(
+                deployment.get("client_name", "unknown"),
+                "(auth check)",
+                "refused_ip",
+                error=f"request from {client_ip}, not in allowed list",
+                ip=client_ip,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied from this network. Contact your vendor if this is unexpected.",
+            )
+
+    # Device binding — optional, per deployment, enabled via
+    # "device_binding_enabled": true in clients.json. Complements IP
+    # allowlisting rather than replacing it: this works regardless of
+    # network location (covers remote/hybrid workers), by tying a key to
+    # whichever specific client installation used it FIRST, rather than
+    # to a network. The first successful request with a given key claims
+    # that key's device slot; any later request with the right key but a
+    # DIFFERENT device ID is refused, even though the key itself is
+    # valid — the key alone stops being sufficient on its own.
+    if deployment.get("device_binding_enabled"):
+        if not device_id:
+            log_query(
+                deployment.get("client_name", "unknown"),
+                "(auth check)",
+                "refused_no_device_id",
+                error="device binding is enabled for this deployment but the request carried no device ID",
+                ip=client_ip,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="This deployment requires device binding, but no device ID was sent. Update your client.",
+            )
+
+        bindings = load_device_bindings()
+        existing = bindings.get(api_key)
+        if existing is None:
+            save_device_binding(api_key, device_id)  # first use — claim this device slot
+        elif existing != device_id:
+            log_query(
+                deployment.get("client_name", "unknown"),
+                "(auth check)",
+                "refused_device_mismatch",
+                error=f"request from device {device_id}, bound to a different device",
+                ip=client_ip,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This API key is already bound to a different device. "
+                    "Contact your vendor if you need it reset (e.g. after a "
+                    "new computer)."
+                ),
+            )
+
     return deployment
 
 
@@ -123,7 +314,7 @@ def authenticate(authorization: Optional[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None) -> None:
+def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None, ip: Optional[str] = None) -> None:
     entry = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "deployment": deployment_name,
@@ -131,6 +322,7 @@ def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[i
         "status": status,
         "row_count": row_count,
         "error": error,
+        "ip": ip,
     }
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -259,24 +451,60 @@ def referenced_tables(sql: str) -> set:
     return {m.upper() for m in TABLE_REF_PATTERN.findall(sql)}
 
 
+def _table_allowed_for_department(table: str, department: str) -> bool:
+    """Check one table against a department's boundary: exact catalog
+    membership first (precise, sourced from the real 382-table catalog),
+    falling back to prefix matching only for a table not yet in that
+    catalog — keeps discovery mode useful for uncatalogued tables without
+    losing the department wall."""
+    exact = getattr(config, "DEPARTMENT_TABLES", {}).get(department)
+    if exact and table in exact:
+        return True
+    prefixes = getattr(config, "DEPARTMENT_TABLE_PREFIXES", {}).get(department, [])
+    return any(table.startswith(p.upper()) for p in (pp.upper() for pp in prefixes))
+
+
+def department_prefixes(deployment: dict) -> Optional[bool]:
+    """Return False if this deployment has no department set (no
+    restriction applies), or True if it does (restriction applies —
+    checked per-table via _table_allowed_for_department)."""
+    return deployment.get("department") is not None
+
+
 def effective_allowed_tables(deployment: dict) -> set:
+    """The curated-list subset visible to this deployment — used only for
+    display purposes (e.g. listing tables in an error message, or in
+    get_jde_schema)."""
     allowed_tables = set(config.ALLOWED_TABLES)
     department = deployment.get("department")
     if not department:
         return allowed_tables
-    prefixes = getattr(config, "DEPARTMENT_TABLE_PREFIXES", {}).get(department)
-    if prefixes is None:
-        return set()
-    return {t for t in allowed_tables if any(t.upper().startswith(p.upper()) for p in prefixes)}
+    return {t for t in allowed_tables if _table_allowed_for_department(t, department)}
 
 
 def uses_only_allowed_tables(sql: str, deployment: dict) -> bool:
     tables = referenced_tables(sql)
     if not tables:
         return False
+
+    # Department boundary — enforced ALWAYS when a department is set,
+    # regardless of discovery mode. Checked against DEPARTMENT_TABLES
+    # (exact, from the real catalog) first, then DEPARTMENT_TABLE_PREFIXES
+    # as a fallback for real tables not yet in that catalog.
+    department = deployment.get("department")
+    if department:
+        has_exact_or_prefix_entry = (
+            department in getattr(config, "DEPARTMENT_TABLES", {})
+            or department in getattr(config, "DEPARTMENT_TABLE_PREFIXES", {})
+        )
+        if not has_exact_or_prefix_entry:
+            return False  # department set but misconfigured — fail closed
+        if not all(_table_allowed_for_department(t, department) for t in tables):
+            return False
+
     if not config.RESTRICT_TO_APPROVED_TABLES:
-        return True
-    return tables.issubset(effective_allowed_tables(deployment))
+        return True  # discovery mode, within whatever department boundary applied above
+    return tables.issubset(config.ALLOWED_TABLES)  # curated mode: must also be reviewed/verified
 
 
 def table_ref(table: str, oracle: bool) -> str:
@@ -301,17 +529,18 @@ class QueryRequest(BaseModel):
 
 
 @app.post("/v1/query")
-def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(default=None)):
-    deployment = authenticate(authorization)
+def query_jde_database(req: QueryRequest, request: Request, authorization: Optional[str] = Header(default=None), x_device_id: Optional[str] = Header(default=None)):
+    client_ip = get_client_ip(request)
+    deployment = authenticate(authorization, client_ip, x_device_id)
     name = deployment.get("client_name", "unknown")
     sql = req.sql
 
     if not is_read_only(sql):
-        log_query(name, sql, "refused_write")
+        log_query(name, sql, "refused_write", ip=client_ip)
         return {"result": "REFUSED: only single SELECT statements are permitted."}
 
     if not uses_only_allowed_tables(sql, deployment):
-        log_query(name, sql, "refused_table")
+        log_query(name, sql, "refused_table", ip=client_ip)
         allowed_list = ", ".join(sorted(effective_allowed_tables(deployment))) or (
             "(no tables configured for this deployment)"
         )
@@ -330,16 +559,16 @@ def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(
         rows = cur.fetchmany(MAX_ROWS + 1)
         conn.close()  # for pooled connections, this releases back to the pool, not a real close
     except Exception as e:
-        log_query(name, sql, "error", error=str(e))
+        log_query(name, sql, "error", error=str(e), ip=client_ip)
         return {"result": f"DATABASE ERROR: {e}"}
 
     if not rows:
-        log_query(name, sql, "executed", row_count=0)
+        log_query(name, sql, "executed", row_count=0, ip=client_ip)
         return {"result": "No matching records were found."}
 
     truncated = len(rows) > MAX_ROWS
     rows = rows[:MAX_ROWS]
-    log_query(name, sql, "executed", row_count=len(rows))
+    log_query(name, sql, "executed", row_count=len(rows), ip=client_ip)
 
     lines = [" | ".join(cols)]
     for row in rows:
@@ -356,8 +585,8 @@ def query_jde_database(req: QueryRequest, authorization: Optional[str] = Header(
 
 
 @app.post("/v1/schema")
-def get_jde_schema(authorization: Optional[str] = Header(default=None)):
-    deployment = authenticate(authorization)
+def get_jde_schema(request: Request, authorization: Optional[str] = Header(default=None), x_device_id: Optional[str] = Header(default=None)):
+    deployment = authenticate(authorization, get_client_ip(request), x_device_id)
     visible_tables = effective_allowed_tables(deployment) if config.RESTRICT_TO_APPROVED_TABLES else None
     oracle = bool(deployment.get("db", {}).get("dsn", "").strip())
 
@@ -444,8 +673,8 @@ REFERENCE_TOPICS = {
 
 
 @app.get("/v1/reference/{topic}")
-def get_reference(topic: str, authorization: Optional[str] = Header(default=None)):
-    authenticate(authorization)  # same active/expiry gate as the DB endpoints
+def get_reference(topic: str, request: Request, authorization: Optional[str] = Header(default=None), x_device_id: Optional[str] = Header(default=None)):
+    authenticate(authorization, get_client_ip(request), x_device_id)  # same active/expiry/IP/device gate as the DB endpoints
 
     filename = REFERENCE_TOPICS.get(topic)
     if filename is None:
@@ -462,6 +691,45 @@ def get_reference(topic: str, authorization: Optional[str] = Header(default=None
         content = f.read()
 
     return {"content": content}
+
+
+@app.get("/admin/export-bindings")
+def export_device_bindings(x_admin_secret: Optional[str] = Header(default=None)):
+    """Dump the current device bindings, with client names attached for
+    readability. Requires ADMIN_SECRET to be set as an environment
+    variable on this server AND sent as the X-Admin-Secret header — this
+    is a completely separate credential from any client API key, since
+    no regular client key should ever be able to see every deployment's
+    device bindings, only their own key's enforcement.
+
+    Manual export/restore workflow (only needed without a real Persistent
+    Disk):
+      1. Before a redeploy, call this endpoint and copy the full response.
+      2. Paste it into the Secret File at DEVICE_BINDINGS_SEED_PATH in
+         Render's dashboard, replacing whatever was there.
+      3. Trigger the redeploy. On startup, the seed file becomes the
+         starting bindings (see seed_device_bindings_if_needed above).
+      4. Repeat before every future deploy — this step is not automatic.
+    """
+    if not ADMIN_SECRET:
+        raise HTTPException(
+            status_code=404,
+            detail="Admin export is not configured on this server (ADMIN_SECRET is unset).",
+        )
+    if not x_admin_secret or not secrets.compare_digest(x_admin_secret, ADMIN_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin secret.")
+
+    bindings = load_device_bindings()
+    clients = load_clients()
+    key_to_name = {k: v.get("client_name", "unknown") for k, v in clients.items()}
+
+    return {
+        "bindings": bindings,  # paste THIS whole object into the seed file's content
+        "readable": [
+            {"client_name": key_to_name.get(k, "(key not in clients.json)"), "device_id": v}
+            for k, v in bindings.items()
+        ],
+    }
 
 
 @app.get("/healthz")
