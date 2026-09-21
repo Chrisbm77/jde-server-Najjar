@@ -416,14 +416,14 @@ def get_connection(deployment: dict):
         pool = _get_or_create_pool(db["user"], db["password"], dsn)
         conn = pool.acquire()
         conn.call_timeout = ORACLE_CALL_TIMEOUT_MS
-        return conn, True
+        return conn, True, pool
 
     # No DSN configured for this deployment yet — fall back to the shared
     # mock DB. Useful for standing up and testing this server before any
     # tunnel is live.
     if not os.path.exists(MOCK_DB_PATH):
         raise RuntimeError("No DSN configured for this deployment, and no mock database found.")
-    return sqlite3.connect(MOCK_DB_PATH), False
+    return sqlite3.connect(MOCK_DB_PATH), False, None
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +528,52 @@ class QueryRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _execute_with_retry(deployment: dict, sql: str):
+    """Run a query, retrying ONCE with a genuinely fresh connection if the
+    first attempt fails. This specifically handles a real failure mode
+    seen in production: a pooled connection that's been sitting idle can
+    get silently killed by an intermediate firewall's idle-connection
+    timeout (seen as DPY-4011 'the database or network closed the
+    connection' / 'Connection reset by peer'), and the pool has no way to
+    know that until it's actually used and fails.
+
+    On failure, if the connection came from a pool, it's explicitly
+    dropped (pool.drop) rather than left to be silently reused — this
+    guarantees the retry gets a genuinely different, live connection
+    rather than risking the same dead one being handed out again.
+
+    Returns (cols, rows) on success, or raises the second attempt's
+    exception if both attempts fail (a real SQL error will fail
+    identically both times and surface normally; a transient dead-connection
+    error has a real chance of succeeding on the retry)."""
+    last_exception = None
+    for attempt in range(2):
+        conn = None
+        pool = None
+        try:
+            conn, _is_oracle, pool = get_connection(deployment)
+            cur = conn.cursor()
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchmany(MAX_ROWS + 1)
+            conn.close()  # releases back to the pool on success
+            return cols, rows
+        except Exception as e:
+            last_exception = e
+            if conn is not None:
+                if pool is not None:
+                    try:
+                        pool.drop(conn)  # force it out — never let a connection that just failed go back in
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    raise last_exception
+
+
 @app.post("/v1/query")
 def query_jde_database(req: QueryRequest, request: Request, authorization: Optional[str] = Header(default=None), x_device_id: Optional[str] = Header(default=None)):
     client_ip = get_client_ip(request)
@@ -552,12 +598,7 @@ def query_jde_database(req: QueryRequest, request: Request, authorization: Optio
         }
 
     try:
-        conn, _is_oracle = get_connection(deployment)
-        cur = conn.cursor()
-        cur.execute(sql)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchmany(MAX_ROWS + 1)
-        conn.close()  # for pooled connections, this releases back to the pool, not a real close
+        cols, rows = _execute_with_retry(deployment, sql)
     except Exception as e:
         log_query(name, sql, "error", error=str(e), ip=client_ip)
         return {"result": f"DATABASE ERROR: {e}"}
