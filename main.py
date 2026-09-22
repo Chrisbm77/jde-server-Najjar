@@ -135,6 +135,27 @@ def save_device_binding(api_key: str, device_id: str) -> None:
         except OSError:
             pass  # a failed write here shouldn't break the request that triggered it
 
+
+def remove_device_binding(api_key: str) -> bool:
+    """Clear one key's device binding on the LIVE running server (not a
+    local file — this is the actual state that matters). Returns True if
+    a binding existed and was removed, False if there was nothing to
+    remove."""
+    with _bindings_lock:
+        bindings = load_device_bindings()
+        if api_key not in bindings:
+            return False
+        del bindings[api_key]
+        serialized = json.dumps(bindings, indent=2)
+        tmp_path = DEVICE_BINDINGS_PATH + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+            os.replace(tmp_path, DEVICE_BINDINGS_PATH)
+        except OSError:
+            pass
+        return True
+
 MAX_ROWS = 200
 ORACLE_CALL_TIMEOUT_MS = 15000
 
@@ -158,8 +179,25 @@ def _on_startup():
 def load_clients() -> dict:
     if not os.path.exists(CLIENTS_PATH):
         return {}
-    with open(CLIENTS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CLIENTS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        # A malformed clients.json (e.g. content pasted on top of old
+        # content instead of replacing it, leaving two JSON objects
+        # concatenated together) previously crashed EVERY request with an
+        # opaque 500 and a raw traceback — every client, not just one.
+        # Fail clearly and controlled instead: one specific, actionable
+        # error, not a stack trace.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"clients.json is not valid JSON ({e}). This blocks ALL "
+                f"clients, not just one — check Render's Secret File for "
+                f"clients.json; a common cause is pasting new content "
+                f"without fully clearing the old content first."
+            ),
+        )
 
 
 def get_client_ip(request: Request) -> str:
@@ -523,6 +561,10 @@ class QueryRequest(BaseModel):
     sql: str
 
 
+class ResetBindingRequest(BaseModel):
+    target: str  # a client_name (or partial match), or the last 8 chars of an API key
+
+
 # ---------------------------------------------------------------------------
 # Endpoints — these mirror the tool names the thin client exposes to Claude
 # ---------------------------------------------------------------------------
@@ -771,6 +813,53 @@ def export_device_bindings(x_admin_secret: Optional[str] = Header(default=None))
             for k, v in bindings.items()
         ],
     }
+
+
+@app.post("/admin/reset-binding")
+def reset_device_binding(req: ResetBindingRequest, x_admin_secret: Optional[str] = Header(default=None)):
+    """Clear one client's device binding on the LIVE server — this is the
+    real fix for 'this person got a new laptop' or 'I need to test with
+    their key myself first,' since it acts on the server's actual current
+    state, not a local file that has no effect on what's actually
+    deployed. Same ADMIN_SECRET gate as the export endpoint.
+
+    target can be a client_name (or partial, case-insensitive match) or
+    the last 8 characters of an API key — same convenience matching as
+    the local reset_device.py script, so you can use whichever you have
+    on hand.
+    """
+    if not ADMIN_SECRET:
+        raise HTTPException(
+            status_code=404,
+            detail="Admin reset is not configured on this server (ADMIN_SECRET is unset).",
+        )
+    if not x_admin_secret or not secrets.compare_digest(x_admin_secret, ADMIN_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin secret.")
+
+    bindings = load_device_bindings()
+    clients = load_clients()
+    key_to_name = {k: v.get("client_name", "unknown") for k, v in clients.items()}
+
+    target = req.target.strip()
+    matches = [
+        api_key for api_key in bindings
+        if target.lower() in key_to_name.get(api_key, "").lower() or api_key.endswith(target)
+    ]
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No active binding found matching '{target}'.")
+    if len(matches) > 1:
+        names = [key_to_name.get(k, "unknown") for k in matches]
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{target}' matches more than one binding ({', '.join(names)}) — be more specific.",
+        )
+
+    api_key = matches[0]
+    name = key_to_name.get(api_key, "unknown")
+    remove_device_binding(api_key)
+
+    return {"result": f"Device binding for '{name}' has been reset. Their next request will claim a new device."}
 
 
 @app.get("/healthz")
