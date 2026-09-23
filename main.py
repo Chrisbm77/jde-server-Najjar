@@ -40,6 +40,7 @@ import threading
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 import ipaddress
 from pydantic import BaseModel
 
@@ -777,7 +778,7 @@ def get_reference(topic: str, request: Request, authorization: Optional[str] = H
 
 
 @app.get("/admin/export-bindings")
-def export_device_bindings(x_admin_secret: Optional[str] = Header(default=None)):
+def export_device_bindings(format: Optional[str] = None, x_admin_secret: Optional[str] = Header(default=None)):
     """Dump the current device bindings, with client names attached for
     readability. Requires ADMIN_SECRET to be set as an environment
     variable on this server AND sent as the X-Admin-Secret header — this
@@ -785,9 +786,15 @@ def export_device_bindings(x_admin_secret: Optional[str] = Header(default=None))
     no regular client key should ever be able to see every deployment's
     device bindings, only their own key's enforcement.
 
+    Add ?format=table to the URL for a genuinely readable plain-text
+    table (real line breaks, not JSON-escaped \\n) — better for reading
+    directly in a terminal. Without it, returns the usual JSON.
+
     Manual export/restore workflow (only needed without a real Persistent
     Disk):
-      1. Before a redeploy, call this endpoint and copy the full response.
+      1. Before a redeploy, call this endpoint (WITHOUT ?format=table —
+         you need the real JSON "bindings" object for this step) and copy
+         the full response.
       2. Paste it into the Secret File at DEVICE_BINDINGS_SEED_PATH in
          Render's dashboard, replacing whatever was there.
       3. Trigger the redeploy. On startup, the seed file becomes the
@@ -806,12 +813,34 @@ def export_device_bindings(x_admin_secret: Optional[str] = Header(default=None))
     clients = load_clients()
     key_to_name = {k: v.get("client_name", "unknown") for k, v in clients.items()}
 
+    readable = [
+        {"client_name": key_to_name.get(k, "(key not in clients.json)"), "api_key": k, "device_id": v}
+        for k, v in bindings.items()
+    ]
+
+    # Build a clean, aligned plain-text table — easy to read directly from
+    # a terminal, rather than parsing the JSON by eye.
+    headers = ("Name", "API Key", "Device ID")
+    rows = [(r["client_name"], r["api_key"], r["device_id"]) for r in readable]
+    col_widths = [
+        max(len(headers[i]), max((len(row[i]) for row in rows), default=0))
+        for i in range(3)
+    ]
+    def fmt_row(cells):
+        return "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(cells))
+    table_lines = [fmt_row(headers), fmt_row(["-" * w for w in col_widths])]
+    table_lines += [fmt_row(row) for row in rows]
+    if not rows:
+        table_lines.append("(no active bindings)")
+    table = "\n".join(table_lines)
+
+    if format == "table":
+        return PlainTextResponse(table)
+
     return {
         "bindings": bindings,  # paste THIS whole object into the seed file's content
-        "readable": [
-            {"client_name": key_to_name.get(k, "(key not in clients.json)"), "device_id": v}
-            for k, v in bindings.items()
-        ],
+        "readable": readable,
+        "table": table,  # same data, formatted as an aligned text table for easy reading
     }
 
 
