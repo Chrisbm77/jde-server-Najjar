@@ -630,15 +630,7 @@ def query_jde_database(req: QueryRequest, request: Request, authorization: Optio
 
     if not uses_only_allowed_tables(sql, deployment):
         log_query(name, sql, "refused_table", ip=client_ip)
-        allowed_list = ", ".join(sorted(effective_allowed_tables(deployment))) or (
-            "(no tables configured for this deployment)"
-        )
-        return {
-            "result": (
-                f"REFUSED: this query references a table outside the approved "
-                f"list. Approved tables are: {allowed_list}."
-            )
-        }
+        return {"result": "REFUSED: you don't have access to that data."}
 
     try:
         cols, rows = _execute_with_retry(deployment, sql)
