@@ -167,7 +167,13 @@ def remove_device_binding(api_key: str) -> bool:
         return True
 
 MAX_ROWS = 200
-ORACLE_CALL_TIMEOUT_MS = 15000
+# How long a single query is allowed to run against Oracle before it's cut
+# off — protects the server (and every other deployment sharing a pool)
+# from one runaway query hanging indefinitely. Raising this lets slow,
+# unfiltered queries against large tables (e.g. the item ledger) succeed,
+# at the cost of that connection staying tied up longer if they do run
+# slow. Configurable so it can be tuned without a code change.
+ORACLE_CALL_TIMEOUT_MS = int(os.environ.get("ORACLE_CALL_TIMEOUT_MS", "30000"))
 
 app = FastAPI(title="JDE Connector API")
 
