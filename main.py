@@ -37,6 +37,8 @@ import json
 import datetime
 import secrets
 import threading
+import urllib.request
+import urllib.error
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -68,6 +70,13 @@ os.makedirs(_data_dir, exist_ok=True)
 
 LOG_PATH = os.path.join(_data_dir, "query_log.jsonl")
 MOCK_DB_PATH = os.path.join(os.path.dirname(__file__), "jde_mock.db")
+
+# Optional: mirror every log entry to a Google Sheet via a webhook (Apps
+# Script web app URL), as an easy, free, zero-infrastructure way to browse
+# the query log without needing a Render Persistent Disk. Leave unset to
+# skip this entirely — nothing else changes if you don't set it.
+GOOGLE_SHEETS_LOG_URL = os.environ.get("GOOGLE_SHEETS_LOG_URL", "").strip()
+GOOGLE_SHEETS_LOG_SECRET = os.environ.get("GOOGLE_SHEETS_LOG_SECRET", "").strip()
 
 # Device binding store — maps API key -> the device ID that first claimed
 # it. Uses the same PERSISTENT_DATA_DIR as LOG_PATH above, for the same
@@ -353,6 +362,29 @@ def authenticate(authorization: Optional[str], client_ip: Optional[str] = None, 
 # ---------------------------------------------------------------------------
 
 
+def _send_to_google_sheet(entry: dict) -> None:
+    """Best-effort mirror of one log entry to the Google Sheet webhook.
+    Runs in its own background thread (see log_query below) so a slow or
+    unreachable sheet never adds latency to an actual query, and any
+    failure here is silent — the local LOG_PATH write already happened
+    regardless of whether this succeeds."""
+    if not GOOGLE_SHEETS_LOG_URL:
+        return
+    payload = dict(entry)
+    if GOOGLE_SHEETS_LOG_SECRET:
+        payload["secret"] = GOOGLE_SHEETS_LOG_SECRET
+    try:
+        req = urllib.request.Request(
+            GOOGLE_SHEETS_LOG_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=8)
+    except Exception:
+        pass  # never let a Sheet hiccup affect anything else
+
+
 def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None, ip: Optional[str] = None) -> None:
     entry = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -368,6 +400,9 @@ def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[i
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass  # logging must never break an actual query
+
+    if GOOGLE_SHEETS_LOG_URL:
+        threading.Thread(target=_send_to_google_sheet, args=(entry,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
