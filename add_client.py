@@ -19,6 +19,7 @@ import secrets
 import sys
 import datetime
 import getpass
+import ipaddress
 
 CLIENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clients.json")
 
@@ -72,6 +73,45 @@ def ask(prompt, default=None, required=True):
         print("This is required — please enter a value.")
 
 
+def ask_yes_no(prompt, default=False):
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        value = input(f"{prompt}{suffix}: ").strip().lower()
+        if not value:
+            return default
+        if value in ("y", "yes"):
+            return True
+        if value in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def ask_allowed_ips():
+    print("\nRestrict this batch to specific networks? (optional — most deployments")
+    print("leave this blank and rely on the API key + device binding instead.)")
+    raw = ask(
+        "Comma-separated IPs or CIDR ranges (e.g. 203.0.113.5, 198.51.100.0/24), or leave blank",
+        default="",
+        required=False,
+    )
+    if not raw:
+        return None
+
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    validated = []
+    for entry in entries:
+        try:
+            if "/" in entry:
+                ipaddress.ip_network(entry, strict=False)
+            else:
+                ipaddress.ip_address(entry)
+            validated.append(entry)
+        except ValueError:
+            print(f"'{entry}' isn't a valid IP address or CIDR range — aborting.")
+            sys.exit(1)
+    return validated
+
+
 def collect_names():
     print("\nEnter each person's name, one at a time. Press Enter on a blank line when done.")
     names = []
@@ -111,6 +151,14 @@ def main():
             print(f"'{expires_on}' isn't a valid YYYY-MM-DD date — aborting.")
             sys.exit(1)
 
+    print("\n--- Security options for this batch ---")
+    device_binding_enabled = ask_yes_no(
+        "Enable device binding? (locks each key to the first computer that uses it —"
+        " recommended for most clients)",
+        default=False,
+    )
+    allowed_ips = ask_allowed_ips()
+
     print("\n--- Database connection for this batch ---")
     print("(This is almost always the same for everyone in one department —")
     print(" answer it once here, it'll apply to every person you add below.)")
@@ -133,6 +181,10 @@ def main():
         }
         if department:
             entry["department"] = department
+        if device_binding_enabled:
+            entry["device_binding_enabled"] = True
+        if allowed_ips:
+            entry["allowed_ips"] = allowed_ips
         new_entries[api_key] = entry
 
     print(f"\n--- About to add {len(new_entries)} client(s) ---")
@@ -160,6 +212,12 @@ def main():
     print("1. Send each key to its person through a secure channel (not this terminal's scrollback).")
     print("2. If clients.json lives on Render as a Secret File, upload this updated version there too.")
     print("3. Give each person the standard install package (same one everyone uses) plus their own key.")
+    if device_binding_enabled:
+        print(
+            "4. Device binding is ON for this batch — each key locks to whichever computer "
+            "uses it first. If someone needs to move to a new computer later, reset their "
+            "binding via POST /admin/reset-binding (see main.py)."
+        )
 
 
 if __name__ == "__main__":
