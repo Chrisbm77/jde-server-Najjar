@@ -388,7 +388,7 @@ def _send_to_google_sheet(entry: dict) -> None:
         pass  # never let a Sheet hiccup affect anything else
 
 
-def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None, ip: Optional[str] = None, device_id: Optional[str] = None) -> None:
+def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[int] = None, error: Optional[str] = None, ip: Optional[str] = None, device_id: Optional[str] = None, tables: Optional[str] = None) -> None:
     entry = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "deployment": deployment_name,
@@ -398,6 +398,7 @@ def log_query(deployment_name: str, sql: str, status: str, row_count: Optional[i
         "error": error,
         "ip": ip,
         "device_id": device_id,
+        "tables": tables,
     }
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -662,28 +663,29 @@ def query_jde_database(req: QueryRequest, request: Request, authorization: Optio
     deployment = authenticate(authorization, client_ip, x_device_id)
     name = deployment.get("client_name", "unknown")
     sql = req.sql
+    tables_used = ", ".join(sorted(referenced_tables(sql)))
 
     if not is_read_only(sql):
-        log_query(name, sql, "refused_write", ip=client_ip, device_id=x_device_id)
+        log_query(name, sql, "refused_write", ip=client_ip, device_id=x_device_id, tables=tables_used)
         return {"result": "REFUSED: only single SELECT statements are permitted."}
 
     if not uses_only_allowed_tables(sql, deployment):
-        log_query(name, sql, "refused_table", ip=client_ip, device_id=x_device_id)
+        log_query(name, sql, "refused_table", ip=client_ip, device_id=x_device_id, tables=tables_used)
         return {"result": "REFUSED: you don't have access to that data."}
 
     try:
         cols, rows = _execute_with_retry(deployment, sql)
     except Exception as e:
-        log_query(name, sql, "error", error=str(e), ip=client_ip, device_id=x_device_id)
+        log_query(name, sql, "error", error=str(e), ip=client_ip, device_id=x_device_id, tables=tables_used)
         return {"result": f"DATABASE ERROR: {e}"}
 
     if not rows:
-        log_query(name, sql, "executed", row_count=0, ip=client_ip, device_id=x_device_id)
+        log_query(name, sql, "executed", row_count=0, ip=client_ip, device_id=x_device_id, tables=tables_used)
         return {"result": "No matching records were found."}
 
     truncated = len(rows) > MAX_ROWS
     rows = rows[:MAX_ROWS]
-    log_query(name, sql, "executed", row_count=len(rows), ip=client_ip, device_id=x_device_id)
+    log_query(name, sql, "executed", row_count=len(rows), ip=client_ip, device_id=x_device_id, tables=tables_used)
 
     lines = [" | ".join(cols)]
     for row in rows:
