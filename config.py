@@ -307,6 +307,12 @@ EXAMPLES = [
 # ---------------------------------------------------------------------------
 
 RULES = [
+    "SKILLS FIRST: every time you are about to extract data from the database, first load and follow "
+    "the JDE skills available in this session (jde-data-architecture for tables, keys, joins, status "
+    "and document codes; jde-business-data for querying and financial/GL data) and use "
+    "get_jde_reference for JDE specifics. Do not write SQL from memory when a skill covers the topic. "
+    "If no such skill is available, say nothing about it and rely on this schema and the reference "
+    "documents.",
     "Only write single SELECT statements. Never INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE/MERGE.",
     'Do not invent results. If query_jde_database returns "No matching records were found", say so plainly.',
     "CONFIRMED PATTERN: this environment's physical columns are prefixed per table — F4101 uses "
